@@ -188,11 +188,59 @@ async function searchLevel({ token, shareKey, entries, targetTitles, year, depth
   return null;
 }
 
+async function searchShareByKeyword({ token, shareKey, query }) {
+  try {
+    const resp = await axios.get('https://www.febbox.com/file/file_share_list', {
+      params: { share_key: shareKey, parent_id: 0, page: 1, wd: query },
+      timeout: 15000,
+      headers: {
+        Cookie: `ui=${token}`,
+        'User-Agent': USER_AGENT,
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+    });
+    const list = resp?.data?.data?.file_list;
+    if (!Array.isArray(list)) return [];
+    return list.map((item) => ({
+      fid: String(item.fid),
+      name: item.file_name || item.name || '',
+      isDir: Boolean(item.is_dir),
+      size: item.file_size || null,
+    }));
+  } catch (err) {
+    return [];
+  }
+}
+
 async function findTitleInMegaShare({ token, shareKeys, title, year, altTitles = [] }) {
-  const targetTitles = [title, ...altTitles].filter(Boolean).map(normalizeTitle);
+  const rawTitles = [title, ...altTitles].filter(Boolean);
+  const targetTitles = rawTitles.map(normalizeTitle);
 
   for (const realShareKey of shareKeys) {
+    // 1. Fast path: server-side FebBox search (1 request, finds titles at any depth)
+    for (const q of rawTitles.slice(0, 2)) {
+      // eslint-disable-next-line no-await-in-loop
+      const hits = await searchShareByKeyword({ token, shareKey: realShareKey, query: q });
+      if (hits.length > 0) {
+        // Prefer exact year match if multiple results exist
+        const yearFiltered = year
+          ? hits.filter((h) => {
+              const y = extractYearFromName(h.name);
+              return !y || Math.abs(y - Number(year)) <= 1;
+            })
+          : hits;
+        const pool = yearFiltered.length > 0 ? yearFiltered : hits;
+        const res = matchBestEntry(pool, targetTitles);
+        if (res.bestMatch && res.bestScore >= 0.72) {
+          return { shareKey: realShareKey, entry: res.bestMatch };
+        }
+      }
+    }
+
+    // 2. Fallback: existing year-folder lookup
+    // eslint-disable-next-line no-await-in-loop
     const rootEntries = await listFolderAllPages({ token, shareKey: realShareKey, parentId: 0 });
+    // eslint-disable-next-line no-await-in-loop
     const found = await searchLevel({
       token,
       shareKey: realShareKey,
@@ -209,7 +257,6 @@ async function findTitleInMegaShare({ token, shareKeys, title, year, altTitles =
   }
   return null;
 }
-
 async function listAllFiles({ token, shareKey }, parentId = 0, depth = 0) {
   if (depth > MAX_RECURSION_DEPTH) return [];
   const entries = await listFolderAllPages({ token, shareKey, parentId });
