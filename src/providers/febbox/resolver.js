@@ -586,6 +586,50 @@ async function resolveMovie({ token, shareKey, playbackMode = DEFAULT_PLAYBACK_M
   return sortWithD
     return sortWithDirectFirst(results);
 }
+async function resolveEpisode({ token, shareKey, season, episode, playbackMode = DEFAULT_PLAYBACK_MODE }) {
+  let activeShareKey = shareKey;
+  let seriesParentId = 0;
+
+  const mb = decodeMovieBoyKey(shareKey);
+  if (mb) {
+    const found = await findTitleInMegaShare({ token, ...mb });
+    activeShareKey = found.shareKey;
+    seriesParentId = found.entry.fid;
+  }
+
+  const videoFiles = await collectEpisodeFiles({
+    token,
+    shareKey: activeShareKey,
+    rootParentId: seriesParentId,
+    season,
+  });
+
+  const matches = videoFiles.filter((f) => matchesEpisodeFlexible(f.name, season, episode));
+  if (matches.length === 0) {
+    throw new FebBoxError(
+      `No files matching S${season}E${episode} found in this FebBox share`,
+      'NOT_FOUND'
+    );
+  }
+
+  const results = [];
+  for (const f of matches) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const streams = await resolveFileStreams({
+        token,
+        shareKey: activeShareKey,
+        fid: f.fid,
+        fileName: f.name,
+        playbackMode,
+      });
+      results.push(...streams);
+    } catch (err) {
+      if (err instanceof FebBoxError && err.code === 'RATE_LIMITED') throw err;
+    }
+  }
+  return sortWithDirectFirst(results);
+}
 
 function isLikelyVideo(name) {
   return /\.(mp4|mkv|avi|mov|webm|m3u8|ts)$/i.test(String(name || ''));
