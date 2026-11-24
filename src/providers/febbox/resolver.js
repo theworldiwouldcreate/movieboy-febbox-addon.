@@ -585,6 +585,63 @@ async function resolveMovie({ token, shareKey, playbackMode = DEFAULT_PLAYBACK_M
   }
   return sortWithD
     return sortWithDirectFirst(results);
+  async function collectEpisodeFiles({ token, shareKey, rootParentId, season }) {
+  const targetSeason = Number(season);
+  const top = rootParentId
+    ? await listFolderAllPages({ token, shareKey, parentId: rootParentId })
+    : await listTopLevel({ token, shareKey });
+
+  const directVideos = top.filter((e) => !e.isDir && isLikelyVideo(e.name));
+  const dirs = top.filter((e) => e.isDir);
+
+  const matchingSeasonDirs = [];
+  const otherSeasonDirs = [];
+  const neutralDirs = [];
+
+  for (const d of dirs) {
+    const m = SEASON_FOLDER_RE.exec(d.name || '');
+    if (m) {
+      if (Number(m[1]) === targetSeason) matchingSeasonDirs.push(d);
+      else otherSeasonDirs.push(d);
+    } else {
+      neutralDirs.push(d);
+    }
+  }
+
+  if (matchingSeasonDirs.length > 0) {
+    let files = [];
+    for (const dir of matchingSeasonDirs) {
+      // eslint-disable-next-line no-await-in-loop
+      files = files.concat(await listAllFiles({ token, shareKey }, dir.fid, 1));
+    }
+    return files.filter((f) => isLikelyVideo(f.name));
+  }
+
+  for (const dir of neutralDirs.slice(0, 6)) {
+    // eslint-disable-next-line no-await-in-loop
+    const subEntries = await listFolderAllPages({ token, shareKey, parentId: dir.fid });
+    const nestedSeason = subEntries.find((e) => {
+      if (!e.isDir) return false;
+      const m = SEASON_FOLDER_RE.exec(e.name || '');
+      return m && Number(m[1]) === targetSeason;
+    });
+    if (nestedSeason) {
+      return (await listAllFiles({ token, shareKey }, nestedSeason.fid, 2)).filter((f) =>
+        isLikelyVideo(f.name)
+      );
+    }
+  }
+
+  let fallbackVideos = [...directVideos];
+  if (otherSeasonDirs.length === 0) {
+    for (const dir of neutralDirs.slice(0, 6)) {
+      // eslint-disable-next-line no-await-in-loop
+      const files = await listAllFiles({ token, shareKey }, dir.fid, 1);
+      fallbackVideos = fallbackVideos.concat(files.filter((f) => isLikelyVideo(f.name)));
+    }
+  }
+  return fallbackVideos;
+}
 }
 async function resolveEpisode({ token, shareKey, season, episode, playbackMode = DEFAULT_PLAYBACK_MODE }) {
   let activeShareKey = shareKey;
