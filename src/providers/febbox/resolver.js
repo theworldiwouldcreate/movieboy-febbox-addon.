@@ -359,4 +359,52 @@ async function resolveEpisode({ token, shareKey, season, episode, playbackMode =
   }
 
   const matches = videoFiles.filter((f) => matchesEpisode(f.name, season, episode));
-  if (matches.length ===
+  if (matches.length === 0) {
+    throw new FebBoxError(
+      `No files matching S${season}E${episode} found in this FebBox share`,
+      'NOT_FOUND'
+    );
+  }
+
+  const results = [];
+  for (const f of matches) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const streams = await resolveFileStreams({ token, shareKey: activeShareKey, fid: f.fid, fileName: f.name, playbackMode });
+      results.push(...streams);
+    } catch (err) {
+      continue;
+    }
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(REQUEST_SPACING_MS);
+  }
+  return sortWithDirectFirst(results);
+}
+
+function isLikelyVideo(name) {
+  return /\.(mp4|mkv|avi|mov|webm|m3u8|ts)$/i.test(String(name || ''));
+}
+
+function extractShareKey(input) {
+  if (!input || typeof input !== 'string') return null;
+  const trimmed = input.trim();
+  const m = trimmed.match(/febbox\.com\/share\/([A-Za-z0-9_-]+)/i);
+  if (m) return m[1];
+  if (/^[A-Za-z0-9_-]{4,40}$/.test(trimmed)) return trimmed;
+  return null;
+}
+
+module.exports = {
+  resolveMovie,
+  resolveEpisode,
+  resolveFileStreams,
+  listAllFiles,
+  extractShareKey,
+  isLikelyVideo,
+  isHlsUrl,
+  sortWithDirectFirst,
+  PLAYBACK_MODE,
+  DEFAULT_PLAYBACK_MODE,
+  PLAYBACK_MODE_VALUES,
+};
+
