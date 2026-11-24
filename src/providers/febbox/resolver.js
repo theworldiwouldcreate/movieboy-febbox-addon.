@@ -3,7 +3,13 @@
 const axios = require('axios');
 const stringSimilarity = require('string-similarity');
 const client = require('./client');
-const { parseQualityListHtml, extractCodecDetails, sortStreamsByQuality, parseSizeToBytes, matchesEpisode } = require('./parser');
+const {
+  parseQualityListHtml,
+  extractCodecDetails,
+  sortStreamsByQuality,
+  parseSizeToBytes,
+  matchesEpisode,
+} = require('./parser');
 const { FebBoxError } = require('./types');
 const { validateDirectUrl } = require('./urlValidate');
 
@@ -13,22 +19,192 @@ const PLAYBACK_MODE_VALUES = new Set(Object.values(PLAYBACK_MODE));
 const INCLUDES_DIRECT = new Set([PLAYBACK_MODE.DIRECT, PLAYBACK_MODE.BOTH]);
 const INCLUDES_HLS = new Set([PLAYBACK_MODE.EXPERIMENTAL_HLS, PLAYBACK_MODE.BOTH]);
 
-const MAX_RECURSION_DEPTH = 4;
-const REQUEST_SPACING_MS = 200;
-const FOLDER_CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
-const MAX_PAGES = 5; // up to 1,250 items per folder
+// Cache TTLs (ms)
+const TTL_FOLDER_MS = 6 * 60 * 60 * 1000;        // 6 hours: root, year, series folders
+const TTL_TITLE_MATCH_MS = 12 * 60 * 60 * 1000;  // 12 hours: resolved title -> folder/file
+const TTL_MISSING_MS = 10 * 60 * 1000;           // 10 minutes: verified genuine NOT_FOUND
+
+// Request pacing & traversal bounds
+const REQUEST_SPACING_MS = 850;
+const MAX_PAGES = 20;
+const MAX_RECURSION_DEPTH = 3;
+const MAX_CONTAINER_BRANCHES = 30; // Handles full A-Z + 0-9 folder structures
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const folderCache = new Map();
 
-function normalizeTitle(t) {
-  return String(t || '')
+// ---------------------------------------------------------------------------
+// Unified TTL Cache & Single-Flight Deduplicator
+// ---------------------------------------------------------------------------
+const ttlCache = new Map();
+const inFlight = new Map();
+
+function cacheGet(key) {
+  const entry = ttlCache.get(key);
+  if (!entry) return undefined;
+  if (Date.now() > entry.expiresAt) {
+    ttlCache.delete(key);
+    return undefined;
+  }
+  return entry.value;
+}
+
+function cacheSet(key, value, ttlMs) {
+  if (ttlMs <= 0) return;
+  ttlCache.set(key, { value, expiresAt: Date.now() + ttlMs });
+}
+
+async function singleFlight(key, fn) {
+  if (inFlight.has(key)) return inFlight.get(key);
+  const promise = (async () => {
+    try {
+      return await fn();
+    } finally {
+      inFlight.delete(key);
+    }
+  })();
+  inFlight.set(key, promise);
+  return promise;
+}
+
+// ---------------------------------------------------------------------------
+// Centralized FebBox Request Queue + Exponential Backoff
+// ---------------------------------------------------------------------------
+let requestChain = Promise.resolve();
+let lastRequestAt = 0;
+
+function isRateLimitSignal(err, data) {
+  const status = err?.response?.status;
+  if (status === 429 || status === 503) return true;
+  if (err instanceof FebBoxError && err.code === 'RATE_LIMITED') return true;
+  const msg = String(data?.msg || data?.message || err?.message || '').toLowerCase();
+  return msg.includes('rate') || msg.includes('too many') || msg.includes('frequent') || msg.includes('limit');
+}
+
+function febboxRequest(fn, { retries = 3 } = {}) {
+  const run = async () => {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const wait = Math.max(0, REQUEST_SPACING_MS - (Date.now() - lastRequestAt));
+      if (wait > 0) await sleep(wait);
+      lastRequestAt = Date.now();
+
+      try {
+        const result = await fn();
+        if (result && typeof result === 'object' && 'code' in result && result.code !== 1 && result.code !== 200) {
+          if (isRateLimitSignal(null, result)) {
+            throw new FebBoxError(result.msg || 'FebBox rate-limited this request', 'RATE_LIMITED');
+          }
+        }
+        return result;
+      } catch (err) {
+        if (isRateLimitSignal(err, err?.response?.data)) {
+          if (attempt < retries) {
+            const backoffMs = 1500 * Math.pow(2, attempt) + Math.floor(Math.random() * 400);
+            console.warn(`[MovieBoy] Rate-limited by FebBox (attempt ${attempt + 1}/${retries + 1}), backing off ${backoffMs}ms`);
+            await sleep(backoffMs);
+            continue;
+          }
+          throw new FebBoxError('FebBox rate-limited this request', 'RATE_LIMITED');
+        }
+        throw err;
+      }
+    }
+    throw new FebBoxError('FebBox rate-limited this request', 'RATE_LIMITED');
+  };
+
+  const chained = requestChain.then(run, run);
+  requestChain = chained.catch(() => {});
+  return chained;
+}
+
+async function fetchSharePage({ token, shareKey, parentId = 0, page = 1, wd = '' }) {
+  return febboxRequest(async () => {
+    const params = { share_key: shareKey, parent_id: parentId, page };
+    if (wd) params.wd = wd;
+
+    const resp = await axios.get('https://www.febbox.com/file/file_share_list', {
+      params,
+      timeout: 15000,
+      headers: {
+        Cookie: `ui=${token}`,
+        'User-Agent': USER_AGENT,
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+    });
+
+    const data = resp?.data;
+    if (isRateLimitSignal(null, data)) {
+      throw new FebBoxError(data?.msg || 'FebBox rate-limited this request', 'RATE_LIMITED');
+    }
+
+    const list = data?.data?.file_list;
+    if (!Array.isArray(list)) return [];
+    return list.map((item) => ({
+      fid: String(item.fid),
+      name: item.file_name || item.name || '',
+      isDir: Boolean(item.is_dir),
+      size: item.file_size || null,
+    }));
+  });
+}
+
+async function listFolderAllPages({ token, shareKey, parentId = 0 }) {
+  const cacheKey = `folder:${shareKey}:${parentId}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== undefined) return cached;
+
+  return singleFlight(cacheKey, async () => {
+    const recheck = cacheGet(cacheKey);
+    if (recheck !== undefined) return recheck;
+
+    const all = [];
+    const seenFids = new Set();
+
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const list = await fetchSharePage({ token, shareKey, parentId, page });
+      if (list.length === 0) break;
+
+      let addedThisPage = 0;
+      for (const item of list) {
+        if (seenFids.has(item.fid)) continue;
+        seenFids.add(item.fid);
+        all.push(item);
+        addedThisPage++;
+      }
+
+      if (list.length < 50 || addedThisPage === 0) break;
+    }
+
+    // Only cache complete, non-empty listings (rate-limit errors throw above and bypass caching)
+    if (all.length > 0) {
+      cacheSet(cacheKey, all, TTL_FOLDER_MS);
+    }
+    return all;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Title Normalization & Matching Helpers
+// ---------------------------------------------------------------------------
+const RELEASE_TAG_RE =
+  /\b(2160p|1080p|720p|480p|4k|uhd|hdr|hdr10|dv|dolby[\s._-]*vision|bluray|blu[\s._-]*ray|bdrip|brrip|web[\s._-]*dl|webrip|web|hdrip|dvdrip|remux|x264|x265|h[\s._-]*264|h[\s._-]*265|hevc|av1|aac\d*(?:\.\d)?|ac3|eac3|ddp?\d(?:\.\d)?|dts(?:-hd)?|truehd|atmos|10bit|8bit|proper|repack|extended|unrated|directors[\s._-]*cut|yts(?:\.[a-z]+)?|rarbg|yify|amzn|nf|dsnp|hmax|atvp)\b.*$/i;
+
+function normalizeTitle(raw) {
+  let s = String(raw || '')
+    .replace(/\.[a-z0-9]{2,4}$/i, '') // strip file extension
+    .replace(/[\[\(\{]\s*(?:19\d{2}|20\d{2})\s*[\]\)\}]/g, ' ') // strip bracketed years
+    .replace(RELEASE_TAG_RE, ' '); // strip trailing scene/release tags
+
+  s = s
+    .replace(/\b(19\d{2}|20\d{2})\b\s*$/, ' ') // strip trailing unbracketed year
     .toLowerCase()
-    .replace(/\(\d{4}\)/g, '')
+    .replace(/&/g, ' and ')
+    .replace(/['’]/g, '')
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
+
+  return s;
 }
 
 function extractYearFromName(name) {
@@ -45,76 +221,40 @@ function decodeMovieBoyKey(shareKey) {
   }
 }
 
-/**
- * Paginated FebBox folder listing (fetches page 1, 2, 3... so folders past
- * the first 50 items — like 2000s/2020s years or large year folders — are found).
- */
-async function listFolderAllPages({ token, shareKey, parentId = 0 }) {
-  const key = `${shareKey}:${parentId}`;
-  const cached = folderCache.get(key);
-  if (cached && Date.now() - cached.ts < FOLDER_CACHE_TTL_MS) {
-    return cached.entries;
+function buildTargetVariants(rawTitles) {
+  const variants = new Set();
+  for (const raw of rawTitles) {
+    const norm = normalizeTitle(raw);
+    if (!norm) continue;
+    variants.add(norm);
+    // Also add version without leading article ("The ", "A ", "An ")
+    const strippedArticle = norm.replace(/^(the|a|an)\s+/, '');
+    if (strippedArticle && strippedArticle !== norm) variants.add(strippedArticle);
   }
-
-  const all = [];
-  const seenFids = new Set();
-
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      const resp = await axios.get('https://www.febbox.com/file/file_share_list', {
-        params: { share_key: shareKey, parent_id: parentId, page },
-        timeout: 15000,
-        headers: {
-          Cookie: `ui=${token}`,
-          'User-Agent': USER_AGENT,
-          'X-Requested-With': 'XMLHttpRequest',
-        },
-      });
-
-      const list = resp?.data?.data?.file_list;
-      if (!Array.isArray(list) || list.length === 0) break;
-
-      let addedThisPage = 0;
-      for (const item of list) {
-        const fid = String(item.fid);
-        if (seenFids.has(fid)) continue;
-        seenFids.add(fid);
-        all.push({
-          fid,
-          name: item.file_name || item.name || '',
-          isDir: Boolean(item.is_dir),
-          size: item.file_size || null,
-        });
-        addedThisPage++;
-      }
-
-      if (list.length < 50 || addedThisPage === 0) break;
-      // eslint-disable-next-line no-await-in-loop
-      await sleep(1500);
-    } catch (err) {
-      if (page === 1) {
-        // Fallback to built-in client on page 1 error
-        const fallback = await client.listShareFiles({ token, shareKey, parentId });
-        folderCache.set(key, { ts: Date.now(), entries: fallback });
-        return fallback;
-      }
-      break;
-    }
-  }
-
-  folderCache.set(key, { ts: Date.now(), entries: all });
-  return all;
+  return [...variants];
 }
 
-function matchBestEntry(entries, targetTitles) {
+function matchBestEntry(entries, targetVariants, expectedYear = null) {
   let bestMatch = null;
   let bestScore = 0;
+
   for (const item of entries) {
     const normName = normalizeTitle(item.name);
     if (!normName) continue;
-    for (const t of targetTitles) {
-      const score = stringSimilarity.compareTwoStrings(t, normName);
+    const itemYear = extractYearFromName(item.name);
+
+    for (const target of targetVariants) {
+      let score = stringSimilarity.compareTwoStrings(target, normName);
+      if (normName === target) score = 1.0;
+
+      // Boost or penalize based on year alignment when both have years
+      if (expectedYear && itemYear) {
+        const diff = Math.abs(itemYear - Number(expectedYear));
+        if (diff === 0) score += 0.06;
+        else if (diff === 1) score += 0.02;
+        else score -= 0.25;
+      }
+
       if (score > bestScore) {
         bestScore = score;
         bestMatch = item;
@@ -124,148 +264,223 @@ function matchBestEntry(entries, targetTitles) {
   return { bestMatch, bestScore };
 }
 
-async function searchLevel({ token, shareKey, entries, targetTitles, year, depth = 0 }) {
-  const direct = matchBestEntry(entries, targetTitles);
+// ---------------------------------------------------------------------------
+// Bounded Recursive & Prioritized Mega-Share Discovery
+// ---------------------------------------------------------------------------
+async function searchShareByKeyword({ token, shareKey, query }) {
+  const cleanQuery = String(query || '').trim();
+  if (!cleanQuery) return [];
+
+  const cacheKey = `wd:${shareKey}:${cleanQuery.toLowerCase()}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== undefined) return cached;
+
+  return singleFlight(cacheKey, async () => {
+    const recheck = cacheGet(cacheKey);
+    if (recheck !== undefined) return recheck;
+
+    // Rate-limit errors intentionally propagate upward rather than returning []
+    const hits = await fetchSharePage({ token, shareKey, parentId: 0, page: 1, wd: cleanQuery });
+    if (hits.length > 0) {
+      cacheSet(cacheKey, hits, TTL_FOLDER_MS);
+    }
+    return hits;
+  });
+}
+
+async function boundedRecursiveSearch({
+  token,
+  shareKey,
+  entries,
+  targetVariants,
+  year,
+  depth = 0,
+  visited = new Set(),
+}) {
+  // 1. Direct match at current directory level
+  const direct = matchBestEntry(entries, targetVariants, year);
   if (direct.bestMatch && direct.bestScore >= 0.80) {
     return { shareKey, entry: direct.bestMatch };
   }
 
-  const dirs = entries.filter((e) => e.isDir);
+  if (depth >= MAX_RECURSION_DEPTH) return null;
 
-  const yearFolders = dirs
-    .map((d) => ({ dir: d, y: extractYearFromName(d.name) }))
-    .filter((x) => x.y !== null);
+  const dirs = entries.filter((e) => e.isDir && !visited.has(e.fid));
+  if (dirs.length === 0) return null;
 
-  if (yearFolders.length > 0) {
-    let candidates = yearFolders;
-    if (year) {
-      const targetYear = Number(year);
-      candidates = yearFolders
-        .filter((x) => x.y === targetYear)
-        .sort((a, b) => Math.abs(a.y - targetYear) - Math.abs(b.y - targetYear));
+  // 2. Prioritize four-digit year directories (exact year -> +/-1 year -> remaining years)
+  const yearDirs = [];
+  const otherDirs = [];
+  for (const d of dirs) {
+    const y = extractYearFromName(d.name);
+    if (y !== null && /^\s*(?:movies|tv|shows|series)?\s*[\(\[]?(19\d{2}|20\d{2})[\)\]]?\s*$/i.test(d.name)) {
+      yearDirs.push({ dir: d, y });
+    } else {
+      otherDirs.push(d);
     }
+  }
 
-    let bestMatch = null;
-    let bestScore = 0;
-    for (const { dir } of candidates) {
-      // eslint-disable-next-line no-await-in-loop
-      const items = await listFolderAllPages({ token, shareKey, parentId: dir.fid });
-      const res = matchBestEntry(items, targetTitles);
-      if (res.bestScore > bestScore) {
-        bestScore = res.bestScore;
-        bestMatch = res.bestMatch;
+  if (yearDirs.length > 0) {
+    const targetYear = year ? Number(year) : null;
+    const prioritized = targetYear
+      ? [
+          ...yearDirs.filter((x) => x.y === targetYear),
+          ...yearDirs.filter((x) => Math.abs(x.y - targetYear) === 1),
+        ]
+      : yearDirs.slice(0, 5);
+
+    for (const { dir } of prioritized) {
+      visited.add(dir.fid);
+      const children = await listFolderAllPages({ token, shareKey, parentId: dir.fid });
+      const res = matchBestEntry(children, targetVariants, year);
+      if (res.bestMatch && res.bestScore >= 0.74) {
+        return { shareKey, entry: res.bestMatch };
       }
-      if (bestScore >= 0.90) break;
-    }
-    if (bestMatch && bestScore >= 0.72) {
-      return { shareKey, entry: bestMatch };
     }
   }
 
-  const firstChar = (targetTitles[0] || '')[0] || '';
-  const alphaFolder = dirs.find((d) => {
-    const n = String(d.name || '').trim().toLowerCase();
-    return n === firstChar || (/[0-9]/.test(firstChar) && /^0[\s-]*9$/.test(n));
+  // 3. Alphabetical / bucket folders (supports full A-Z, 0-9, or range folders like "A-F")
+  const primaryTitle = targetVariants[0] || '';
+  const firstChar = primaryTitle[0] || '';
+  const matchingAlphaDirs = otherDirs.filter((d) => {
+    const label = String(d.name || '').trim().toLowerCase();
+    if (!firstChar) return false;
+    if (label === firstChar) return true;
+    if (/[0-9]/.test(firstChar) && /^(0[\s-]*9|#)$/.test(label)) return true;
+    const range = label.match(/^([a-z])\s*-\s*([a-z])$/);
+    if (range && firstChar >= range[1] && firstChar <= range[2]) return true;
+    return false;
   });
-  if (alphaFolder) {
-    const items = await listFolderAllPages({ token, shareKey, parentId: alphaFolder.fid });
-    const res = matchBestEntry(items, targetTitles);
-    if (res.bestMatch && res.bestScore >= 0.72) {
-      return { shareKey, entry: res.bestMatch };
-    }
+
+  for (const dir of matchingAlphaDirs) {
+    visited.add(dir.fid);
+    const children = await listFolderAllPages({ token, shareKey, parentId: dir.fid });
+    const found = await boundedRecursiveSearch({
+      token,
+      shareKey,
+      entries: children,
+      targetVariants,
+      year,
+      depth: depth + 1,
+      visited,
+    });
+    if (found) return found;
   }
 
-  if (depth === 0 && dirs.length > 0 && dirs.length <= 10) {
-    for (const dir of dirs) {
-      // eslint-disable-next-line no-await-in-loop
-      const subEntries = await listFolderAllPages({ token, shareKey, parentId: dir.fid });
-      // eslint-disable-next-line no-await-in-loop
-      const found = await searchLevel({ token, shareKey, entries: subEntries, targetTitles, year, depth: 1 });
-      if (found) return found;
-    }
+  // 4. Bounded traversal of remaining container folders (e.g., "Movies", "4K", "TV Shows")
+  const nonYearRemaining = otherDirs
+    .filter((d) => !visited.has(d.fid) && d.name.length > 2)
+    .slice(0, MAX_CONTAINER_BRANCHES);
+
+  for (const dir of nonYearRemaining) {
+    visited.add(dir.fid);
+    const children = await listFolderAllPages({ token, shareKey, parentId: dir.fid });
+    const found = await boundedRecursiveSearch({
+      token,
+      shareKey,
+      entries: children,
+      targetVariants,
+      year,
+      depth: depth + 1,
+      visited,
+    });
+    if (found) return found;
   }
 
   return null;
-}
-
-async function searchShareByKeyword({ token, shareKey, query }) {
-  try {
-    const resp = await axios.get('https://www.febbox.com/file/file_share_list', {
-      params: { share_key: shareKey, parent_id: 0, page: 1, wd: query },
-      timeout: 15000,
-      headers: {
-        Cookie: `ui=${token}`,
-        'User-Agent': USER_AGENT,
-        'X-Requested-With': 'XMLHttpRequest',
-      },
-    });
-    const list = resp?.data?.data?.file_list;
-    if (!Array.isArray(list)) return [];
-    return list.map((item) => ({
-      fid: String(item.fid),
-      name: item.file_name || item.name || '',
-      isDir: Boolean(item.is_dir),
-      size: item.file_size || null,
-    }));
-  } catch (err) {
-    return [];
-  }
 }
 
 async function findTitleInMegaShare({ token, shareKeys, title, year, altTitles = [] }) {
   const rawTitles = [title, ...altTitles].filter(Boolean);
-  const targetTitles = rawTitles.map(normalizeTitle);
+  const targetVariants = buildTargetVariants(rawTitles);
+  const discoveryKey = `discover:${shareKeys.join(',')}:${normalizeTitle(title)}:${year || ''}`;
 
-  for (const realShareKey of shareKeys) {
-    // 1. Fast path: server-side FebBox search (1 request, finds titles at any depth)
-    for (const q of rawTitles.slice(0, 2)) {
-      // eslint-disable-next-line no-await-in-loop
-      const hits = await searchShareByKeyword({ token, shareKey: realShareKey, query: q });
-      if (hits.length > 0) {
-        // Prefer exact year match if multiple results exist
-        const yearFiltered = year
-          ? hits.filter((h) => {
-              const y = extractYearFromName(h.name);
-              return !y || Math.abs(y - Number(year)) <= 1;
-            })
-          : hits;
-        const pool = yearFiltered.length > 0 ? yearFiltered : hits;
-        const res = matchBestEntry(pool, targetTitles);
-        if (res.bestMatch && res.bestScore >= 0.72) {
-          return { shareKey: realShareKey, entry: res.bestMatch };
-        }
+  const cached = cacheGet(discoveryKey);
+  if (cached !== undefined) {
+    if (cached === null) {
+      throw new FebBoxError(`Title "${title}" not found in MovieBoy share (cached miss)`, 'NOT_FOUND');
+    }
+    return cached;
+  }
+
+  return singleFlight(discoveryKey, async () => {
+    const recheck = cacheGet(discoveryKey);
+    if (recheck !== undefined) {
+      if (recheck === null) {
+        throw new FebBoxError(`Title "${title}" not found in MovieBoy share (cached miss)`, 'NOT_FOUND');
       }
+      return recheck;
     }
 
-    // 2. Fallback: existing year-folder lookup
-    // eslint-disable-next-line no-await-in-loop
-    const rootEntries = await listFolderAllPages({ token, shareKey: realShareKey, parentId: 0 });
-    // eslint-disable-next-line no-await-in-loop
-    const found = await searchLevel({
-      token,
-      shareKey: realShareKey,
-      entries: rootEntries,
-      targetTitles,
-      year,
-      depth: 0,
-    });
-    if (found) return found;
+    let searchFailedOrDegraded = false;
 
-    console.log(
-      `[MovieBoy] Missed "${title}" (${year}) in share ${realShareKey}. Total root entries: ${rootEntries.length}`
-    );
-  }
-  return null;
+    for (const realShareKey of shareKeys) {
+      // Phase 1: Server-side keyword search (fast path, 1 request)
+      for (const q of rawTitles.slice(0, 2)) {
+        try {
+          const hits = await searchShareByKeyword({ token, shareKey: realShareKey, query: q });
+          if (hits.length > 0) {
+            const res = matchBestEntry(hits, targetVariants, year);
+            if (res.bestMatch && res.bestScore >= 0.75) {
+              const found = { shareKey: realShareKey, entry: res.bestMatch };
+              cacheSet(discoveryKey, found, TTL_TITLE_MATCH_MS);
+              return found;
+            }
+          }
+        } catch (err) {
+          if (err instanceof FebBoxError && err.code === 'RATE_LIMITED') throw err;
+          searchFailedOrDegraded = true;
+          console.warn(`[MovieBoy] Keyword search degraded for "${q}" in ${realShareKey}: ${err.message}`);
+        }
+      }
+
+      // Phase 2: Bounded recursive folder search (Year -> Alpha -> Container)
+      const rootEntries = await listFolderAllPages({ token, shareKey: realShareKey, parentId: 0 });
+      if (rootEntries.length === 0) {
+        searchFailedOrDegraded = true;
+        continue;
+      }
+
+      const found = await boundedRecursiveSearch({
+        token,
+        shareKey: realShareKey,
+        entries: rootEntries,
+        targetVariants,
+        year,
+        depth: 0,
+        visited: new Set(),
+      });
+
+      if (found) {
+        cacheSet(discoveryKey, found, TTL_TITLE_MATCH_MS);
+        return found;
+      }
+
+      console.info(
+        `[MovieBoy] Title "${title}" (${year || 'n/a'}) absent after scanning share ${realShareKey} (${rootEntries.length} root entries)`
+      );
+    }
+
+    if (searchFailedOrDegraded) {
+      // Do NOT negative-cache when FebBox returned incomplete/errored responses
+      throw new FebBoxError(`FebBox search incomplete for "${title}"`, 'SEARCH_FAILED');
+    }
+
+    // Genuine confirmed miss: cache for 10 minutes to prevent repeat crawls
+    cacheSet(discoveryKey, null, TTL_MISSING_MS);
+    throw new FebBoxError(`Title "${title}" not found in MovieBoy share`, 'NOT_FOUND');
+  });
 }
+
+// ---------------------------------------------------------------------------
+// File Listing & Stream Extraction
+// ---------------------------------------------------------------------------
 async function listAllFiles({ token, shareKey }, parentId = 0, depth = 0) {
   if (depth > MAX_RECURSION_DEPTH) return [];
   const entries = await listFolderAllPages({ token, shareKey, parentId });
   let all = [];
   for (const entry of entries) {
     if (entry.isDir) {
-      // eslint-disable-next-line no-await-in-loop
-      await sleep(REQUEST_SPACING_MS);
-      // eslint-disable-next-line no-await-in-loop
       all = all.concat(await listAllFiles({ token, shareKey }, entry.fid, depth + 1));
     } else {
       all.push(entry);
@@ -303,7 +518,7 @@ function sortWithDirectFirst(streams) {
 }
 
 async function resolveFileStreams({ token, shareKey, fid, fileName, playbackMode = DEFAULT_PLAYBACK_MODE }) {
-  const html = await client.getVideoQualityLinks({ token, shareKey, fid });
+  const html = await febboxRequest(() => client.getVideoQualityLinks({ token, shareKey, fid }));
   const allLinks = parseQualityListHtml(html);
   const directCandidates = allLinks.filter((l) => !isHlsUrl(l.url));
   const hlsCandidates = allLinks.filter((l) => isHlsUrl(l.url));
@@ -336,9 +551,6 @@ async function resolveMovie({ token, shareKey, playbackMode = DEFAULT_PLAYBACK_M
   const mb = decodeMovieBoyKey(shareKey);
   if (mb) {
     const found = await findTitleInMegaShare({ token, ...mb });
-    if (!found) {
-      throw new FebBoxError(`Movie "${mb.title}" not found in MovieBoy share`, 'NOT_FOUND');
-    }
     activeShareKey = found.shareKey;
     if (found.entry.isDir) {
       const files = await listAllFiles({ token, shareKey: activeShareKey }, found.entry.fid, 1);
@@ -359,73 +571,20 @@ async function resolveMovie({ token, shareKey, playbackMode = DEFAULT_PLAYBACK_M
   for (const f of videoFiles) {
     try {
       // eslint-disable-next-line no-await-in-loop
-      const streams = await resolveFileStreams({ token, shareKey: activeShareKey, fid: f.fid, fileName: f.name, playbackMode });
+      const streams = await resolveFileStreams({
+        token,
+        shareKey: activeShareKey,
+        fid: f.fid,
+        fileName: f.name,
+        playbackMode,
+      });
       results.push(...streams);
     } catch (err) {
-      continue;
+      if (err instanceof FebBoxError && err.code === 'RATE_LIMITED') throw err;
     }
-    // eslint-disable-next-line no-await-in-loop
-    await sleep(REQUEST_SPACING_MS);
   }
-  return sortWithDirectFirst(results);
-}
-
-const SEASON_FOLDER_RE = /season[^0-9]{0,3}0*(\d+)\b/i;
-
-async function resolveEpisode({ token, shareKey, season, episode, playbackMode = DEFAULT_PLAYBACK_MODE }) {
-  let activeShareKey = shareKey;
-  let seriesParentId = 0;
-
-  const mb = decodeMovieBoyKey(shareKey);
-  if (mb) {
-    const found = await findTitleInMegaShare({ token, ...mb });
-    if (!found) {
-      throw new FebBoxError(`Series "${mb.title}" not found in MovieBoy share`, 'NOT_FOUND');
-    }
-    activeShareKey = found.shareKey;
-    seriesParentId = found.entry.fid;
-  }
-
-  const top = seriesParentId
-    ? await listFolderAllPages({ token, shareKey: activeShareKey, parentId: seriesParentId })
-    : await listTopLevel({ token, shareKey: activeShareKey });
-
-  const seasonFolder = top.find((e) => {
-    if (!e.isDir) return false;
-    const m = SEASON_FOLDER_RE.exec(e.name || '');
-    return m && Number(m[1]) === Number(season);
-  });
-
-  let videoFiles;
-  if (seasonFolder) {
-    const files = await listAllFiles({ token, shareKey: activeShareKey }, seasonFolder.fid, 1);
-    videoFiles = files.filter((f) => isLikelyVideo(f.name));
-  } else {
-    const files = await listAllFiles({ token, shareKey: activeShareKey }, seriesParentId, 1);
-    videoFiles = files.filter((f) => isLikelyVideo(f.name));
-  }
-
-  const matches = videoFiles.filter((f) => matchesEpisode(f.name, season, episode));
-  if (matches.length === 0) {
-    throw new FebBoxError(
-      `No files matching S${season}E${episode} found in this FebBox share`,
-      'NOT_FOUND'
-    );
-  }
-
-  const results = [];
-  for (const f of matches) {
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      const streams = await resolveFileStreams({ token, shareKey: activeShareKey, fid: f.fid, fileName: f.name, playbackMode });
-      results.push(...streams);
-    } catch (err) {
-      continue;
-    }
-    // eslint-disable-next-line no-await-in-loop
-    await sleep(REQUEST_SPACING_MS);
-  }
-  return sortWithDirectFirst(results);
+  return sortWithD
+    return sortWithDirectFirst(results);
 }
 
 function isLikelyVideo(name) {
@@ -454,4 +613,3 @@ module.exports = {
   DEFAULT_PLAYBACK_MODE,
   PLAYBACK_MODE_VALUES,
 };
-
