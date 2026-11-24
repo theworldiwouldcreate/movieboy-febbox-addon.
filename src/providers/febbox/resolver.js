@@ -1,5 +1,6 @@
 'use strict';
 
+const axios = require('axios');
 const stringSimilarity = require('string-similarity');
 const client = require('./client');
 const { parseQualityListHtml, extractCodecDetails, sortStreamsByQuality, parseSizeToBytes, matchesEpisode } = require('./parser');
@@ -13,8 +14,11 @@ const INCLUDES_DIRECT = new Set([PLAYBACK_MODE.DIRECT, PLAYBACK_MODE.BOTH]);
 const INCLUDES_HLS = new Set([PLAYBACK_MODE.EXPERIMENTAL_HLS, PLAYBACK_MODE.BOTH]);
 
 const MAX_RECURSION_DEPTH = 4;
-const REQUEST_SPACING_MS = 250;
+const REQUEST_SPACING_MS = 200;
 const FOLDER_CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+const MAX_PAGES = 25; // up to 1,250 items per folder
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const folderCache = new Map();
@@ -41,15 +45,66 @@ function decodeMovieBoyKey(shareKey) {
   }
 }
 
-async function listFolderCached({ token, shareKey, parentId = 0 }) {
+/**
+ * Paginated FebBox folder listing (fetches page 1, 2, 3... so folders past
+ * the first 50 items — like 2000s/2020s years or large year folders — are found).
+ */
+async function listFolderAllPages({ token, shareKey, parentId = 0 }) {
   const key = `${shareKey}:${parentId}`;
   const cached = folderCache.get(key);
   if (cached && Date.now() - cached.ts < FOLDER_CACHE_TTL_MS) {
     return cached.entries;
   }
-  const entries = await client.listShareFiles({ token, shareKey, parentId });
-  folderCache.set(key, { ts: Date.now(), entries });
-  return entries;
+
+  const all = [];
+  const seenFids = new Set();
+
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const resp = await axios.get('https://www.febbox.com/file/file_share_list', {
+        params: { share_key: shareKey, parent_id: parentId, page },
+        timeout: 15000,
+        headers: {
+          Cookie: `ui=${token}`,
+          'User-Agent': USER_AGENT,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+      });
+
+      const list = resp?.data?.data?.file_list;
+      if (!Array.isArray(list) || list.length === 0) break;
+
+      let addedThisPage = 0;
+      for (const item of list) {
+        const fid = String(item.fid);
+        if (seenFids.has(fid)) continue;
+        seenFids.add(fid);
+        all.push({
+          fid,
+          name: item.file_name || item.name || '',
+          isDir: Boolean(item.is_dir),
+          size: item.file_size || null,
+        });
+        addedThisPage++;
+      }
+
+      if (list.length < 50 || addedThisPage === 0) break;
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(150);
+    } catch (err) {
+      if (page === 1) {
+        // Fallback to built-in client on page 1 error
+        const fallback = await client.listShareFiles({ token, shareKey, parentId });
+        folderCache.set(key, { ts: Date.now(), entries: fallback });
+        return fallback;
+      }
+      break;
+    }
+  }
+
+  folderCache.set(key, { ts: Date.now(), entries: all });
+  return all;
 }
 
 function matchBestEntry(entries, targetTitles) {
@@ -69,15 +124,7 @@ function matchBestEntry(entries, targetTitles) {
   return { bestMatch, bestScore };
 }
 
-/**
- * Smart folder finder for MovieBoy shares:
- * 1. Checks direct match at current level
- * 2. Checks Year folders (exact year, then ±1 year)
- * 3. Checks A-Z / single-letter folders
- * 4. Unwraps up to 1 level of container folders (e.g. "Movies", "TV Shows")
- */
 async function searchLevel({ token, shareKey, entries, targetTitles, year, depth = 0 }) {
-  // 1. Direct match at this level (for flat shares)
   const direct = matchBestEntry(entries, targetTitles);
   if (direct.bestMatch && direct.bestScore >= 0.80) {
     return { shareKey, entry: direct.bestMatch };
@@ -85,7 +132,6 @@ async function searchLevel({ token, shareKey, entries, targetTitles, year, depth
 
   const dirs = entries.filter((e) => e.isDir);
 
-  // 2. Year folders (e.g. "2024", "Movies 2024", etc.)
   const yearFolders = dirs
     .map((d) => ({ dir: d, y: extractYearFromName(d.name) }))
     .filter((x) => x.y !== null);
@@ -103,7 +149,7 @@ async function searchLevel({ token, shareKey, entries, targetTitles, year, depth
     let bestScore = 0;
     for (const { dir } of candidates) {
       // eslint-disable-next-line no-await-in-loop
-      const items = await listFolderCached({ token, shareKey, parentId: dir.fid });
+      const items = await listFolderAllPages({ token, shareKey, parentId: dir.fid });
       const res = matchBestEntry(items, targetTitles);
       if (res.bestScore > bestScore) {
         bestScore = res.bestScore;
@@ -116,25 +162,23 @@ async function searchLevel({ token, shareKey, entries, targetTitles, year, depth
     }
   }
 
-  // 3. A-Z / alphabetical folders (e.g. "A", "B", "H", "O", "0-9")
   const firstChar = (targetTitles[0] || '')[0] || '';
   const alphaFolder = dirs.find((d) => {
     const n = String(d.name || '').trim().toLowerCase();
     return n === firstChar || (/[0-9]/.test(firstChar) && /^0[\s-]*9$/.test(n));
   });
   if (alphaFolder) {
-    const items = await listFolderCached({ token, shareKey, parentId: alphaFolder.fid });
+    const items = await listFolderAllPages({ token, shareKey, parentId: alphaFolder.fid });
     const res = matchBestEntry(items, targetTitles);
     if (res.bestMatch && res.bestScore >= 0.72) {
       return { shareKey, entry: res.bestMatch };
     }
   }
 
-  // 4. Unwrap container folders (e.g. "Movies", "TVshow") one level deep
   if (depth === 0 && dirs.length > 0 && dirs.length <= 10) {
     for (const dir of dirs) {
       // eslint-disable-next-line no-await-in-loop
-      const subEntries = await listFolderCached({ token, shareKey, parentId: dir.fid });
+      const subEntries = await listFolderAllPages({ token, shareKey, parentId: dir.fid });
       // eslint-disable-next-line no-await-in-loop
       const found = await searchLevel({ token, shareKey, entries: subEntries, targetTitles, year, depth: 1 });
       if (found) return found;
@@ -148,7 +192,7 @@ async function findTitleInMegaShare({ token, shareKeys, title, year, altTitles =
   const targetTitles = [title, ...altTitles].filter(Boolean).map(normalizeTitle);
 
   for (const realShareKey of shareKeys) {
-    const rootEntries = await listFolderCached({ token, shareKey: realShareKey, parentId: 0 });
+    const rootEntries = await listFolderAllPages({ token, shareKey: realShareKey, parentId: 0 });
     const found = await searchLevel({
       token,
       shareKey: realShareKey,
@@ -159,10 +203,8 @@ async function findTitleInMegaShare({ token, shareKeys, title, year, altTitles =
     });
     if (found) return found;
 
-    // Log root folder names to Render logs so we can see the exact layout if it still misses
     console.log(
-      `[MovieBoy] Missed "${title}" (${year}) in share ${realShareKey}. Root entries (${rootEntries.length}):`,
-      rootEntries.slice(0, 10).map((e) => e.name)
+      `[MovieBoy] Missed "${title}" (${year}) in share ${realShareKey}. Total root entries: ${rootEntries.length}`
     );
   }
   return null;
@@ -170,7 +212,7 @@ async function findTitleInMegaShare({ token, shareKeys, title, year, altTitles =
 
 async function listAllFiles({ token, shareKey }, parentId = 0, depth = 0) {
   if (depth > MAX_RECURSION_DEPTH) return [];
-  const entries = await client.listShareFiles({ token, shareKey, parentId });
+  const entries = await listFolderAllPages({ token, shareKey, parentId });
   let all = [];
   for (const entry of entries) {
     if (entry.isDir) {
@@ -186,7 +228,7 @@ async function listAllFiles({ token, shareKey }, parentId = 0, depth = 0) {
 }
 
 async function listTopLevel({ token, shareKey }) {
-  return client.listShareFiles({ token, shareKey, parentId: 0 });
+  return listFolderAllPages({ token, shareKey, parentId: 0 });
 }
 
 function isHlsUrl(url) {
@@ -298,7 +340,7 @@ async function resolveEpisode({ token, shareKey, season, episode, playbackMode =
   }
 
   const top = seriesParentId
-    ? await listFolderCached({ token, shareKey: activeShareKey, parentId: seriesParentId })
+    ? await listFolderAllPages({ token, shareKey: activeShareKey, parentId: seriesParentId })
     : await listTopLevel({ token, shareKey: activeShareKey });
 
   const seasonFolder = top.find((e) => {
@@ -317,51 +359,4 @@ async function resolveEpisode({ token, shareKey, season, episode, playbackMode =
   }
 
   const matches = videoFiles.filter((f) => matchesEpisode(f.name, season, episode));
-  if (matches.length === 0) {
-    throw new FebBoxError(
-      `No files matching S${season}E${episode} found in this FebBox share`,
-      'NOT_FOUND'
-    );
-  }
-
-  const results = [];
-  for (const f of matches) {
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      const streams = await resolveFileStreams({ token, shareKey: activeShareKey, fid: f.fid, fileName: f.name, playbackMode });
-      results.push(...streams);
-    } catch (err) {
-      continue;
-    }
-    // eslint-disable-next-line no-await-in-loop
-    await sleep(REQUEST_SPACING_MS);
-  }
-  return sortWithDirectFirst(results);
-}
-
-function isLikelyVideo(name) {
-  return /\.(mp4|mkv|avi|mov|webm|m3u8|ts)$/i.test(String(name || ''));
-}
-
-function extractShareKey(input) {
-  if (!input || typeof input !== 'string') return null;
-  const trimmed = input.trim();
-  const m = trimmed.match(/febbox\.com\/share\/([A-Za-z0-9_-]+)/i);
-  if (m) return m[1];
-  if (/^[A-Za-z0-9_-]{4,40}$/.test(trimmed)) return trimmed;
-  return null;
-}
-
-module.exports = {
-  resolveMovie,
-  resolveEpisode,
-  resolveFileStreams,
-  listAllFiles,
-  extractShareKey,
-  isLikelyVideo,
-  isHlsUrl,
-  sortWithDirectFirst,
-  PLAYBACK_MODE,
-  DEFAULT_PLAYBACK_MODE,
-  PLAYBACK_MODE_VALUES,
-};
+  if (matches.length ===
