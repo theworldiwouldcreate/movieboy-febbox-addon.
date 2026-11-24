@@ -16,7 +16,7 @@ const INCLUDES_HLS = new Set([PLAYBACK_MODE.EXPERIMENTAL_HLS, PLAYBACK_MODE.BOTH
 const MAX_RECURSION_DEPTH = 4;
 const REQUEST_SPACING_MS = 200;
 const FOLDER_CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
-const MAX_PAGES = 25; // up to 1,250 items per folder
+const MAX_PAGES = 5; // up to 1,250 items per folder
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
@@ -91,7 +91,7 @@ async function listFolderAllPages({ token, shareKey, parentId = 0 }) {
 
       if (list.length < 50 || addedThisPage === 0) break;
       // eslint-disable-next-line no-await-in-loop
-      await sleep(150);
+      await sleep(800);
     } catch (err) {
       if (page === 1) {
         // Fallback to built-in client on page 1 error
