@@ -17,7 +17,7 @@ const REQUEST_SPACING_MS = 250;
 const FOLDER_CACHE_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const folderCache = new Map(); // cacheKey -> { ts, entries }
+const folderCache = new Map();
 
 function normalizeTitle(t) {
   return String(t || '')
@@ -25,6 +25,11 @@ function normalizeTitle(t) {
     .replace(/\(\d{4}\)/g, '')
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
+}
+
+function extractYearFromName(name) {
+  const m = String(name || '').match(/\b(19\d{2}|20\d{2})\b/);
+  return m ? Number(m[1]) : null;
 }
 
 function decodeMovieBoyKey(shareKey) {
@@ -47,49 +52,118 @@ async function listFolderCached({ token, shareKey, parentId = 0 }) {
   return entries;
 }
 
+function matchBestEntry(entries, targetTitles) {
+  let bestMatch = null;
+  let bestScore = 0;
+  for (const item of entries) {
+    const normName = normalizeTitle(item.name);
+    if (!normName) continue;
+    for (const t of targetTitles) {
+      const score = stringSimilarity.compareTwoStrings(t, normName);
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = item;
+      }
+    }
+  }
+  return { bestMatch, bestScore };
+}
+
 /**
- * Find a matching Series or Movie entry inside a Year -> Title FebBox share.
- * Only crawls the target year (±1 year) to stay fast on Render free tier.
+ * Smart folder finder for MovieBoy shares:
+ * 1. Checks direct match at current level
+ * 2. Checks Year folders (exact year, then ±1 year)
+ * 3. Checks A-Z / single-letter folders
+ * 4. Unwraps up to 1 level of container folders (e.g. "Movies", "TV Shows")
  */
+async function searchLevel({ token, shareKey, entries, targetTitles, year, depth = 0 }) {
+  // 1. Direct match at this level (for flat shares)
+  const direct = matchBestEntry(entries, targetTitles);
+  if (direct.bestMatch && direct.bestScore >= 0.80) {
+    return { shareKey, entry: direct.bestMatch };
+  }
+
+  const dirs = entries.filter((e) => e.isDir);
+
+  // 2. Year folders (e.g. "2024", "Movies 2024", etc.)
+  const yearFolders = dirs
+    .map((d) => ({ dir: d, y: extractYearFromName(d.name) }))
+    .filter((x) => x.y !== null);
+
+  if (yearFolders.length > 0) {
+    let candidates = yearFolders;
+    if (year) {
+      const targetYear = Number(year);
+      candidates = yearFolders
+        .filter((x) => Math.abs(x.y - targetYear) <= 1)
+        .sort((a, b) => Math.abs(a.y - targetYear) - Math.abs(b.y - targetYear));
+    }
+
+    let bestMatch = null;
+    let bestScore = 0;
+    for (const { dir } of candidates) {
+      // eslint-disable-next-line no-await-in-loop
+      const items = await listFolderCached({ token, shareKey, parentId: dir.fid });
+      const res = matchBestEntry(items, targetTitles);
+      if (res.bestScore > bestScore) {
+        bestScore = res.bestScore;
+        bestMatch = res.bestMatch;
+      }
+      if (bestScore >= 0.90) break;
+    }
+    if (bestMatch && bestScore >= 0.72) {
+      return { shareKey, entry: bestMatch };
+    }
+  }
+
+  // 3. A-Z / alphabetical folders (e.g. "A", "B", "H", "O", "0-9")
+  const firstChar = (targetTitles[0] || '')[0] || '';
+  const alphaFolder = dirs.find((d) => {
+    const n = String(d.name || '').trim().toLowerCase();
+    return n === firstChar || (/[0-9]/.test(firstChar) && /^0[\s-]*9$/.test(n));
+  });
+  if (alphaFolder) {
+    const items = await listFolderCached({ token, shareKey, parentId: alphaFolder.fid });
+    const res = matchBestEntry(items, targetTitles);
+    if (res.bestMatch && res.bestScore >= 0.72) {
+      return { shareKey, entry: res.bestMatch };
+    }
+  }
+
+  // 4. Unwrap container folders (e.g. "Movies", "TVshow") one level deep
+  if (depth === 0 && dirs.length > 0 && dirs.length <= 10) {
+    for (const dir of dirs) {
+      // eslint-disable-next-line no-await-in-loop
+      const subEntries = await listFolderCached({ token, shareKey, parentId: dir.fid });
+      // eslint-disable-next-line no-await-in-loop
+      const found = await searchLevel({ token, shareKey, entries: subEntries, targetTitles, year, depth: 1 });
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
 async function findTitleInMegaShare({ token, shareKeys, title, year, altTitles = [] }) {
   const targetTitles = [title, ...altTitles].filter(Boolean).map(normalizeTitle);
 
   for (const realShareKey of shareKeys) {
     const rootEntries = await listFolderCached({ token, shareKey: realShareKey, parentId: 0 });
-    const yearFolders = rootEntries.filter((e) => e.isDir && /^\d{4}$/.test(String(e.name || '').trim()));
+    const found = await searchLevel({
+      token,
+      shareKey: realShareKey,
+      entries: rootEntries,
+      targetTitles,
+      year,
+      depth: 0,
+    });
+    if (found) return found;
 
-    // Prioritize exact year, then year - 1 and year + 1
-    let candidateYears = yearFolders;
-    if (year) {
-      const targetYear = Number(year);
-      candidateYears = yearFolders
-        .filter((f) => Math.abs(Number(f.name.trim()) - targetYear) <= 1)
-        .sort((a, b) => Math.abs(Number(a.name.trim()) - targetYear) - Math.abs(Number(b.name.trim()) - targetYear));
-    }
-
-    let bestMatch = null;
-    let bestScore = 0;
-
-    for (const yFolder of candidateYears) {
-      // eslint-disable-next-line no-await-in-loop
-      const items = await listFolderCached({ token, shareKey: realShareKey, parentId: yFolder.fid });
-      for (const item of items) {
-        const normName = normalizeTitle(item.name);
-        if (!normName) continue;
-        for (const t of targetTitles) {
-          const score = stringSimilarity.compareTwoStrings(t, normName);
-          if (score > bestScore) {
-            bestScore = score;
-            bestMatch = { shareKey: realShareKey, entry: item };
-          }
-        }
-      }
-      if (bestScore >= 0.92) break; // strong match found, no need to check other years
-    }
-
-    if (bestMatch && bestScore >= 0.72) {
-      return bestMatch;
-    }
+    // Log root folder names to Render logs so we can see the exact layout if it still misses
+    console.log(
+      `[MovieBoy] Missed "${title}" (${year}) in share ${realShareKey}. Root entries (${rootEntries.length}):`,
+      rootEntries.slice(0, 10).map((e) => e.name)
+    );
   }
   return null;
 }
