@@ -91,7 +91,7 @@ async function listFolderAllPages({ token, shareKey, parentId = 0 }) {
 
       if (list.length < 50 || addedThisPage === 0) break;
       // eslint-disable-next-line no-await-in-loop
-      await sleep(800);
+      await sleep(1500);
     } catch (err) {
       if (page === 1) {
         // Fallback to built-in client on page 1 error
@@ -141,7 +141,7 @@ async function searchLevel({ token, shareKey, entries, targetTitles, year, depth
     if (year) {
       const targetYear = Number(year);
       candidates = yearFolders
-        .filter((x) => Math.abs(x.y - targetYear) <= 1)
+        .filter((x) => x.y === targetYear)
         .sort((a, b) => Math.abs(a.y - targetYear) - Math.abs(b.y - targetYear));
     }
 
